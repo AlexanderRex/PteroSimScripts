@@ -1,23 +1,23 @@
 """
 RL smoke test for PteroSim (spawn + gates + actuators + IMU).
 
-1. Unreal: Play (симуляция уже слушает gRPC).
-2. Git Bash из корня проекта:
+1. Unreal: Play (simulation must already be listening on gRPC).
+2. Run from project root:
    python scripts/rl_examples/run_rl_race_train.py --mode random
    python scripts/rl_examples/run_rl_race_train.py --mode ppo --timesteps 5000
-   # продолжить с чекпоинта:
+   # continue from checkpoint:
    python scripts/rl_examples/run_rl_race_train.py --mode ppo --timesteps 10000 --load checkpoints/ppo_pterorace_smoke.zip
 
---mode random  Только случайные действия, печать reward (проверка пайплайна).
---mode ppo      Stable-Baselines3 PPO (нужны torch + stable-baselines3).
+--mode random  Random actions only, reward logging (pipeline smoke test).
+--mode ppo      Stable-Baselines3 PPO (requires torch + stable-baselines3).
 
-Графики (TensorBoard), PowerShell из корня проекта:
+TensorBoard charts (PowerShell, from project root):
   .\\.venv\\Scripts\\Activate.ps1
   pip install tensorboard
   python scripts/rl_examples/run_rl_race_train.py --mode ppo --timesteps 5000
-  # второе окно:
+  # second window:
   tensorboard --logdir tensorboard_logs
-  # браузер: http://localhost:6006
+  # browser: http://localhost:6006
 """
 
 from __future__ import annotations
@@ -50,9 +50,9 @@ GATE_POSITIONS = [
 
 OBS_DIM = 19
 MAX_EPISODE_STEPS = 500
-# UE cm: if farther from next gate center than this, episode fails (сброс).
+# UE cm: if farther from next gate center than this, episode fails (reset).
 MAX_DIST_FROM_NEXT_GATE_CM = 7500.0
-# Clip observation for stable PPO (and replace nan/inf — иначе Normal(loc) даёт NaN).
+# Clip observation for stable PPO (replace nan/inf to avoid NaN action params).
 OBS_CLIP = float(1e5)
 
 # Set once before sim.start(); engine rejects changes while Running.
@@ -378,7 +378,7 @@ def run_ppo(
         if tensorboard_log:
             print(
                 f"TensorBoard: tensorboard --logdir {tensorboard_log}  "
-                "(PowerShell, второе окно) -> http://localhost:6006"
+                    "(PowerShell, second window) -> http://localhost:6006"
             )
     finally:
         env.close()
