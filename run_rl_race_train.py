@@ -1,6 +1,12 @@
 """
 RL smoke test for PteroSim (spawn + gates + actuators + IMU).
 
+Tensorboard: From project folder, second terminal after PPO training starts:
+  .venv\Scripts\Activate.ps1
+  pip install tensorboard
+  tensorboard --logdir tensorboard_logs
+  # http://localhost:6006
+
 1. Unreal: Play (simulation must already be listening on gRPC).
 2. Run from project root:
    python scripts/rl_examples/run_rl_race_train.py --mode random
@@ -11,13 +17,7 @@ RL smoke test for PteroSim (spawn + gates + actuators + IMU).
 --mode random  Random actions only, reward logging (pipeline smoke test).
 --mode ppo      Stable-Baselines3 PPO (requires torch + stable-baselines3).
 
-TensorBoard charts (PowerShell, from project root):
-  .\\.venv\\Scripts\\Activate.ps1
-  pip install tensorboard
-  python scripts/rl_examples/run_rl_race_train.py --mode ppo --timesteps 5000
-  # second window:
-  tensorboard --logdir tensorboard_logs
-  # browser: http://localhost:6006
+Example: C:/Users/Yollnahkriin/Documents/Unreal_Projects/PteroSim/.venv/Scripts/python.exe run_rl_race_train.py --mode ppo --timesteps 2000 --load checkpoints/ppo_pterorace_smoke.zip --save checkpoints/ppo_pterorace_smoke  
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 
 from pterosim import PteroSim
+from pterosim.aircraft import Aircraft
 
 try:
     import gymnasium as gym
@@ -55,13 +56,57 @@ MAX_DIST_FROM_NEXT_GATE_CM = 7500.0
 # Clip observation for stable PPO (replace nan/inf to avoid NaN action params).
 OBS_CLIP = float(1e5)
 
+# Reward: bounded per-step progress toward gate (cm -> roughly -1..1 before scale).
+REWARD_DIST_NORM_CM = 2500.0
+REWARD_PROGRESS_SCALE = 0.5
+REWARD_GATE_PASS = 15.0
+REWARD_TERMINAL_CRASH = -4.0
+REWARD_TERMINAL_TOO_FAR = -8.0
+REWARD_TERMINAL_TIMEOUT = -8.0
+REWARD_TERMINAL_SUCCESS = 25.0
+
 # Set once before sim.start(); engine rejects changes while Running.
 PHYSICS_HZ = 1000.0
 SIM_TIME_SCALE = 10.0
 
 
+def wait_for_aircraft_status(
+    sim: PteroSim,
+    instance_id: int | None = None,
+    timeout_s: float = 2.0,
+    poll_interval_s: float = 0.05,
+) -> Any:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        statuses = sim.aircraft_status()
+        if instance_id is None and statuses:
+            return statuses[0]
+        if instance_id is not None:
+            for status in statuses:
+                if status.instance_id == instance_id:
+                    return status
+        time.sleep(poll_interval_s)
+    if instance_id is None:
+        raise RuntimeError("No aircraft status received before timeout")
+    raise RuntimeError(f"Aircraft {instance_id} not found before timeout")
+
+
+def build_controls(sim: PteroSim, instance_id: int) -> list[float]:
+    cfg = sim.get_actuator_configuration(instance_id)
+    controls = [0.55] * min(4, cfg.channel_count)
+    while len(controls) < cfg.channel_count:
+        controls.append(0.0)
+    return controls
+
+
+def remove_all_aircraft(sim: PteroSim) -> None:
+    # Remove every existing aircraft before spawning a fresh one.
+    for status in list(sim.aircraft_status()):
+        Aircraft(sim, status.instance_id).remove()
+
+
 def get_observation(sim: PteroSim, instance_id: int) -> dict[str, Any]:
-    status = next(s for s in sim.aircraft_status() if s.instance_id == instance_id)
+    status = wait_for_aircraft_status(sim, instance_id=instance_id)
     race = sim.get_race_state(instance_id)
     gate = sim.get_next_gate_pose(instance_id)
     imu = sim.get_imu(instance_id)
@@ -114,21 +159,32 @@ def compute_reward(
     done: bool,
     reason: str,
 ) -> float:
-    if done and reason == "crash":
-        return -100.0
-    if done and reason == "too_far":
-        return -50.0
-    if done and reason == "timeout":
-        return -1.0
-    reward = 0.0
-    if prev_obs is not None:
-        reward += (prev_obs["dist_to_next_gate"] - obs["dist_to_next_gate"]) * 0.01
+    """Sparse gate bonus + bounded progress; terminal terms added (not replacing step reward)."""
     if prev_obs is None:
         gp_prev = 0
     else:
         gp_prev = prev_obs["gates_passed"]
+
+    reward = 0.0
+    if prev_obs is not None:
+        d0 = prev_obs["dist_to_next_gate"]
+        d1 = obs["dist_to_next_gate"]
+        progress = float(np.clip((d0 - d1) / REWARD_DIST_NORM_CM, -1.0, 1.0))
+        reward += REWARD_PROGRESS_SCALE * progress
+
     if obs["gates_passed"] > gp_prev:
-        reward += 100.0 * (obs["gates_passed"] - gp_prev)
+        reward += REWARD_GATE_PASS * (obs["gates_passed"] - gp_prev)
+
+    if done:
+        if reason == "crash":
+            reward += REWARD_TERMINAL_CRASH
+        elif reason == "too_far":
+            reward += REWARD_TERMINAL_TOO_FAR
+        elif reason == "timeout":
+            reward += REWARD_TERMINAL_TIMEOUT
+        elif reason == "success":
+            reward += REWARD_TERMINAL_SUCCESS
+
     return reward
 
 
@@ -137,40 +193,41 @@ def apply_action(sim: PteroSim, instance_id: int, action: np.ndarray, controls_b
     a = np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=-1.0)
     a = np.clip(a, -1.0, 1.0)
     th = ((a + 1.0) * 0.5).clip(0.0, 1.0)
-    for i in range(min(4, len(controls_buffer))):
-        controls_buffer[i] = float(th[i])
-    sim.set_actuator_controls(instance_id, controls_buffer)
+    controls = list(controls_buffer)
+    for i in range(min(4, len(controls))):
+        controls[i] = float(th[i])
+    sim.set_actuator_controls(instance_id, controls)
 
 
-def reset_race_session(sim: PteroSim) -> None:
+def reset_race_session(sim: PteroSim, aircraft_class: str) -> tuple[int, int, list[float]]:
     sim.stop()
-    time.sleep(0.25)
+    remove_all_aircraft(sim)
+    drone = sim.spawn(aircraft_class, **DRONE_SPAWN)
+    drone_id = drone.instance_id
     sim.set_track_gates(GATE_POSITIONS)
     sim.reset_all_races()
+    sim.reset_race(drone_id)
     sim.start()
-    time.sleep(0.25)
+    wait_for_aircraft_status(sim, instance_id=drone_id)
+    track = sim.get_track_info()
+    controls = build_controls(sim, drone_id)
+    return drone_id, track.gate_count, controls
 
 
-def run_random(sim_addr: str, aircraft: str, episodes: int, max_dist_gate_cm: float) -> None:
+def run_random(
+    sim_addr: str,
+    aircraft: str,
+    episodes: int,
+    max_dist_gate_cm: float,
+    seed: int | None,
+) -> None:
     with PteroSim(sim_addr) as sim:
         sim.set_physics_frequency(PHYSICS_HZ)
         sim.set_time_scale(SIM_TIME_SCALE)
 
-        drone = sim.spawn(aircraft, **DRONE_SPAWN)
-        drone_id = drone.instance_id
-        track = sim.set_track_gates(GATE_POSITIONS)
-        total_gates = track.gate_count
+        drone_id, total_gates, controls = reset_race_session(sim, aircraft)
 
-        cfg = sim.get_actuator_configuration(drone_id)
-        controls = [0.55] * min(4, cfg.channel_count)
-        while len(controls) < cfg.channel_count:
-            controls.append(0.0)
-
-        sim.start()
-        time.sleep(0.5)
-        sim.reset_all_races()
-
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(seed)
 
         for ep in range(episodes):
             obs_dict = get_observation(sim, drone_id)
@@ -207,12 +264,7 @@ def run_random(sim_addr: str, aircraft: str, episodes: int, max_dist_gate_cm: fl
 
             print(f"[random EP {ep}] {reason=} gates={obs_dict['gates_passed']}/{total_gates} R={total_r:.1f}")
 
-            reset_race_session(sim)
-            statuses = sim.aircraft_status()
-            if not statuses:
-                print("No aircraft after reset, stop.")
-                break
-            drone_id = statuses[0].instance_id
+            drone_id, total_gates, controls = reset_race_session(sim, aircraft)
 
         sim.stop()
 
@@ -251,16 +303,6 @@ if gym is not None and spaces is not None:
             self._sim = PteroSim(self.sim_address)
             self._sim.set_physics_frequency(PHYSICS_HZ)
             self._sim.set_time_scale(SIM_TIME_SCALE)
-            drone = self._sim.spawn(self.aircraft_class, **DRONE_SPAWN)
-            self._drone_id = drone.instance_id
-            track = self._sim.set_track_gates(GATE_POSITIONS)
-            self._total_gates = track.gate_count
-            cfg = self._sim.get_actuator_configuration(self._drone_id)
-            self._controls = [0.55] * min(4, cfg.channel_count)
-            while len(self._controls) < cfg.channel_count:
-                self._controls.append(0.0)
-            self._sim.start()
-            time.sleep(0.5)
 
         def reset(
             self,
@@ -271,10 +313,9 @@ if gym is not None and spaces is not None:
             super().reset(seed=seed)
             self._connect()
             assert self._sim is not None
-            reset_race_session(self._sim)
-            sts = self._sim.aircraft_status()
-            if sts:
-                self._drone_id = sts[0].instance_id
+            self._drone_id, self._total_gates, self._controls = reset_race_session(
+                self._sim, self.aircraft_class
+            )
             self._step_count = 0
             self._prev_obs_dict = None
             obs_dict = get_observation(self._sim, self._drone_id)
@@ -327,8 +368,9 @@ def run_ppo(
     run_name: str,
     load_path: str | None,
     save_path: str,
+    seed: int | None,
 ) -> None:
-    if gym is None:
+    if gym is None or spaces is None or "PteroRaceEnv" not in globals():
         raise SystemExit("Install gymnasium: pip install gymnasium")
     from pathlib import Path
 
@@ -341,6 +383,7 @@ def run_ppo(
         aircraft_class=aircraft,
         max_dist_from_next_gate_cm=max_dist_gate_cm,
     )
+    env.reset(seed=seed)
     try:
         load_kwargs: dict = {"env": env, "verbose": 1}
         if tensorboard_log:
@@ -367,6 +410,7 @@ def run_ppo(
                 "policy": "MlpPolicy",
                 "env": env,
                 "verbose": 1,
+                "seed": seed,
             }
             if tensorboard_log:
                 ppo_kwargs["tensorboard_log"] = tensorboard_log
@@ -421,10 +465,16 @@ def main() -> int:
         default="checkpoints/ppo_pterorace_smoke",
         help="PPO: save path without extension (SB3 adds .zip)",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility (random mode and PPO)",
+    )
     args = parser.parse_args()
 
     if args.mode == "random":
-        run_random(args.sim, args.aircraft, args.episodes, args.max_dist_gate)
+        run_random(args.sim, args.aircraft, args.episodes, args.max_dist_gate, args.seed)
     else:
         tb = args.tensorboard_log.strip() or None
         load_p = args.load.strip() or None
@@ -437,6 +487,7 @@ def main() -> int:
             run_name=args.run_name,
             load_path=load_p,
             save_path=args.save,
+            seed=args.seed,
         )
 
     return 0
