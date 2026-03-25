@@ -1,4 +1,3 @@
-
 # PteroSim Python Examples
 
 Python scripts and examples for [PteroSim](https://github.com/PteroLabsAI/PteroSim-UAV-Simulator) UAV simulator.
