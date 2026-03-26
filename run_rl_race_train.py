@@ -56,20 +56,9 @@ MAX_DIST_FROM_NEXT_GATE_CM = 7500.0
 # Clip observation for stable PPO (replace nan/inf to avoid NaN action params).
 OBS_CLIP = float(1e5)
 
-# Reward: bounded per-step progress toward gate (cm -> roughly -1..1 before scale).
-REWARD_DIST_NORM_CM = 2500.0
-REWARD_PROGRESS_SCALE = 0.5
-REWARD_GATE_PASS = 15.0
-REWARD_TERMINAL_CRASH = -4.0
-REWARD_TERMINAL_TOO_FAR = -8.0
-REWARD_TERMINAL_TIMEOUT = -8.0
-REWARD_TERMINAL_SUCCESS = 25.0
-
 # Set once before sim.start(); engine rejects changes while Running.
 PHYSICS_HZ = 1000.0
 SIM_TIME_SCALE = 10.0
-
-
 def wait_for_aircraft_status(
     sim: PteroSim,
     instance_id: int | None = None,
@@ -153,38 +142,56 @@ def obs_to_vector(obs: dict) -> np.ndarray:
     return np.clip(v, -OBS_CLIP, OBS_CLIP)
 
 
+def gate_approach_shaping(delta_dist: float, closest_cm: float) -> float:
+    """Shaping from distance change toward next gate (UE cm). closest_cm = min(prev, cur)."""
+    if delta_dist == 0.0:
+        return 0.0
+    if delta_dist < 0.0:
+        if closest_cm <= 500.0:
+            scale = 0.01
+        elif closest_cm >= 2000.0:
+            scale = 0.04
+        else:
+            t = (closest_cm - 500.0) / (2000.0 - 500.0)
+            scale = 0.01 + t * (0.04 - 0.01)
+        return delta_dist * scale
+    # delta_dist > 0: bonus * 0.01, multiplier interpolated 4→3→2→1 by distance bands
+    if closest_cm <= 500.0:
+        mult = 4.0
+    elif closest_cm <= 1000.0:
+        t = (closest_cm - 500.0) / (1000.0 - 500.0)
+        mult = 4.0 + t * (3.0 - 4.0)
+    elif closest_cm <= 2000.0:
+        t = (closest_cm - 1000.0) / (2000.0 - 1000.0)
+        mult = 3.0 + t * (2.0 - 3.0)
+    else:
+        mult = 1.0
+    return delta_dist * 0.01 * mult
+
+
 def compute_reward(
     obs: dict,
     prev_obs: dict | None,
     done: bool,
     reason: str,
 ) -> float:
-    """Sparse gate bonus + bounded progress; terminal terms added (not replacing step reward)."""
+    if done and reason == "crash":
+        return -10.0
+    if done and reason == "too_far":
+        return -100.0
+    if done and reason == "timeout":
+        return -50.0
+    reward = 0.0
+    if prev_obs is not None:
+        delta_dist = prev_obs["dist_to_next_gate"] - obs["dist_to_next_gate"]
+        closest_cm = min(prev_obs["dist_to_next_gate"], obs["dist_to_next_gate"])
+        reward += gate_approach_shaping(delta_dist, closest_cm)
     if prev_obs is None:
         gp_prev = 0
     else:
         gp_prev = prev_obs["gates_passed"]
-
-    reward = 0.0
-    if prev_obs is not None:
-        d0 = prev_obs["dist_to_next_gate"]
-        d1 = obs["dist_to_next_gate"]
-        progress = float(np.clip((d0 - d1) / REWARD_DIST_NORM_CM, -1.0, 1.0))
-        reward += REWARD_PROGRESS_SCALE * progress
-
     if obs["gates_passed"] > gp_prev:
-        reward += REWARD_GATE_PASS * (obs["gates_passed"] - gp_prev)
-
-    if done:
-        if reason == "crash":
-            reward += REWARD_TERMINAL_CRASH
-        elif reason == "too_far":
-            reward += REWARD_TERMINAL_TOO_FAR
-        elif reason == "timeout":
-            reward += REWARD_TERMINAL_TIMEOUT
-        elif reason == "success":
-            reward += REWARD_TERMINAL_SUCCESS
-
+        reward += 100.0 * (obs["gates_passed"] - gp_prev)
     return reward
 
 
