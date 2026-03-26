@@ -1,0 +1,13 @@
+# Core numeric/RL dependencies used by run_rl_race_train.py
+numpy
+gymnasium
+stable-baselines3
+torch
+tensorboard
+
+# PteroSim SDK runtime dependencies (from the main PteroSim repository)
+grpcio>=1.60.0
+protobuf>=4.25.0
+
+# Install local PteroSim Python SDK from your main repo
+-e ../Unreal_Projects/PteroSim/Plugins/PteroSimScripting/SDK/python
