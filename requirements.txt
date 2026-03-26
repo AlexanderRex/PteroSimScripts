@@ -9,5 +9,4 @@ tensorboard
 grpcio>=1.60.0
 protobuf>=4.25.0
 
-# Install local PteroSim Python SDK from your main repo
--e ../Unreal_Projects/PteroSim/Plugins/PteroSimScripting/SDK/python
+# To interact with the simulator API, download and install the PteroSim SDK.
