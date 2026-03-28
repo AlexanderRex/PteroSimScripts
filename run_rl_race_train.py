@@ -273,6 +273,8 @@ REWARD_DEFAULTS = {
     "gate_bonus": 100.0,          # bonus per gate passed
     "crash_penalty": -50.0,
     "too_far_penalty": -20.0,
+    "timeout_penalty": -30.0,     # penalty for running out of time (incentivize speed)
+    "time_penalty": -0.05,        # per-step penalty (incentivize finishing fast)
     "att_coef": 0.05,             # attitude penalty coefficient
     "att_threshold_deg": 25.0,    # threshold below which no attitude penalty
     "proximity_bonus": 0.1,       # small alive bonus when near gate (<3000cm)
@@ -288,8 +290,8 @@ def gate_approach_shaping(delta_dist: float, closest_cm: float) -> float:
         return 0.0
     scale = reward_config["approach_scale"]
     if delta_dist < 0.0:
-        # Moving away — smaller penalty, proportional to scale
-        return delta_dist * scale * 0.25
+        # Moving away — symmetric penalty (prevents approach-retreat farming)
+        return delta_dist * scale
     # Moving toward gate — scale up when close
     if closest_cm <= 500.0:
         mult = 4.0
@@ -315,9 +317,9 @@ def compute_reward(
     if done and reason == "too_far":
         return reward_config["too_far_penalty"]
     if done and reason == "timeout":
-        return 0.0
+        return reward_config["timeout_penalty"]
 
-    reward = 0.0
+    reward = reward_config["time_penalty"]
 
     # Gate approach shaping
     if prev_obs is not None:
@@ -590,6 +592,7 @@ def run_train(
     from pathlib import Path
 
     from stable_baselines3 import PPO, SAC
+    from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
     from stable_baselines3.common.monitor import Monitor
 
     algo_cls = {"ppo": PPO, "sac": SAC}[algo]
@@ -640,12 +643,21 @@ def run_train(
             model = algo_cls(**common_kwargs)
             reset_num = True
 
-        cb = ProgressCallback(timesteps) if ProgressCallback else None
+        callbacks = []
+        progress_total = timesteps if reset_num else timesteps + model.num_timesteps
+        if ProgressCallback:
+            callbacks.append(ProgressCallback(progress_total))
+        callbacks.append(CheckpointCallback(
+            save_freq=10_000,
+            save_path="checkpoints/",
+            name_prefix=f"{algo}_pterorace",
+            save_replay_buffer=False,
+        ))
         model.learn(
             total_timesteps=timesteps,
             tb_log_name=run_name,
             reset_num_timesteps=reset_num,
-            callback=cb,
+            callback=CallbackList(callbacks),
         )
         model.save(save_path)
         print(f"Saved policy to {save_path}")
@@ -685,6 +697,7 @@ def run_play(
         sim.hold()
         print(f"Drone spawned (id={drone_id}). Press Enter to start playback...")
         input()
+        sim.start()
 
         for ep in range(episodes):
             obs_dict = get_observation(sim, drone_id)
