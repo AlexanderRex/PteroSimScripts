@@ -5,12 +5,13 @@ RL agent outputs attitude commands (roll/pitch angles + yaw rate + throttle).
 C++ QuadXAttitudeController (Crazyflie-style cascaded PID) runs at 1000 Hz
 on the physics thread, converting attitude commands to motor throttles.
 
-Architecture:
-  RL Agent (10 Hz, via time_scale=100)
-    → attitude command (roll, pitch, yaw_rate, throttle)
+Architecture (free-run):
+  Simulation runs continuously at PHYSICS_HZ × time_scale.
+  RL Agent sends attitude commands and reads observations via gRPC.
+  No step_once — physics never pauses during training.
     → gRPC set_attitude_command
-    → C++ PID at 1000 Hz → JSBSim motors
-    → step_once (100 physics ticks)
+    → C++ PID at 1000 Hz → JSBSim motors (continuous)
+    → gRPC get observations (async read)
 
 Modes:
   --mode random   Random actions (pipeline smoke test)
@@ -121,7 +122,8 @@ NORM_GYRO = 5.0            # rad/s
 NORM_DIST = 7500.0         # cm (max gate distance)
 
 PHYSICS_HZ = 1000.0
-DEFAULT_TIME_SCALE = 100.0  # 100 physics ticks per step_once → agent at 10 Hz
+DEFAULT_TIME_SCALE = 100.0  # simulation speed multiplier
+AGENT_DT_S = 0.1            # agent decision interval in sim-seconds (10 Hz)
 
 GRACE_STEPS = 10
 
@@ -394,6 +396,7 @@ def wait_for_aircraft_status(
     raise RuntimeError(f"Aircraft {instance_id} not found before timeout")
 
 
+
 def remove_all_aircraft(sim: PteroSim) -> None:
     for status in list(sim.aircraft_status()):
         Aircraft(sim, status.instance_id).remove()
@@ -457,7 +460,8 @@ def run_random(
                 des_roll, des_pitch, yaw_rate, throttle = action_to_commands(action)
 
                 send_attitude_command(sim, drone_id, des_roll, des_pitch, yaw_rate, throttle)
-                sim.step_once()
+
+                time.sleep(AGENT_DT_S / time_scale)
 
                 next_dict = get_observation(sim, drone_id)
                 terminated, truncated, reason = check_episode_end(next_dict, t + 1, total_gates, max_dist_gate_cm)
@@ -500,7 +504,6 @@ if gym is not None and spaces is not None:
             self.aircraft_class = aircraft_class
             self.max_dist_from_next_gate_cm = max_dist_from_next_gate_cm
             self.time_scale = time_scale
-            # Action: roll, pitch, throttle, yaw_rate (all [-1,1])
             self.action_space = spaces.Box(
                 low=-1.0, high=1.0, shape=(4,), dtype=np.float32
             )
@@ -548,7 +551,9 @@ if gym is not None and spaces is not None:
 
             send_attitude_command(self._sim, self._drone_id,
                                  des_roll, des_pitch, yaw_rate, throttle)
-            self._sim.step_once()
+
+            # Let physics advance ~AGENT_DT_S sim-seconds before reading obs
+            time.sleep(AGENT_DT_S / self.time_scale)
 
             obs_dict = get_observation(self._sim, self._drone_id)
             obs = obs_to_vector(obs_dict)
@@ -617,6 +622,11 @@ def run_train(
                 load_kwargs["tensorboard_log"] = tensorboard_log
             model = algo_cls.load(str(lp), **load_kwargs)
             print(f"Loaded {algo.upper()} policy from {load_path}, continuing for {timesteps} timesteps")
+            if algo == "sac":
+                rb_path = Path(str(lp).replace(".zip", "_replay_buffer.pkl"))
+                if rb_path.is_file():
+                    model.load_replay_buffer(str(rb_path))
+                    print(f"Loaded replay buffer from {rb_path} ({model.replay_buffer.size()} transitions)")
             reset_num = False
         else:
             common_kwargs: dict = {
@@ -637,7 +647,19 @@ def run_train(
                     train_freq=4,
                     gradient_steps=4,
                     learning_starts=2000,
-                    ent_coef="auto_0.1",
+                    ent_coef=0.1,
+                    policy_kwargs={"net_arch": [256, 256]},
+                )
+            elif algo == "ppo":
+                common_kwargs.update(
+                    learning_rate=3e-4,
+                    n_steps=2048,
+                    batch_size=256,
+                    n_epochs=10,
+                    gamma=0.99,
+                    gae_lambda=0.95,
+                    clip_range=0.2,
+                    ent_coef=0.01,
                     policy_kwargs={"net_arch": [256, 256]},
                 )
             model = algo_cls(**common_kwargs)
@@ -660,6 +682,9 @@ def run_train(
             callback=CallbackList(callbacks),
         )
         model.save(save_path)
+        if algo == "sac":
+            model.save_replay_buffer(f"{save_path}_replay_buffer")
+            print(f"Saved replay buffer to {save_path}_replay_buffer")
         print(f"Saved policy to {save_path}")
         if tensorboard_log:
             print(
@@ -688,52 +713,40 @@ def run_play(
     except Exception:
         model = PPO.load(str(lp))
 
-    with PteroSim(sim_addr) as sim:
-        sim.set_physics_frequency(PHYSICS_HZ)
-        sim.set_time_scale(time_scale)
+    # Use the SAME env as training — guarantees identical setup/reset/obs
+    env = PteroRaceEnv(
+        sim_address=sim_addr,
+        aircraft_class=aircraft,
+        max_dist_from_next_gate_cm=max_dist_gate_cm,
+        time_scale=time_scale,
+    )
 
-        drone_id, total_gates = setup_race(sim, aircraft)
-
-        sim.hold()
-        print(f"Drone spawned (id={drone_id}). Press Enter to start playback...")
-        input()
-        sim.start()
-
+    try:
         for ep in range(episodes):
-            obs_dict = get_observation(sim, drone_id)
-            prev_obs_dict = None
-            obs = obs_to_vector(obs_dict)
+            obs, _ = env.reset()
             total_r = 0.0
             steps = 0
 
             while True:
                 action, _ = model.predict(obs, deterministic=True)
-                des_roll, des_pitch, yaw_rate, throttle = action_to_commands(action)
-
-                send_attitude_command(sim, drone_id, des_roll, des_pitch, yaw_rate, throttle)
-                sim.step_once()
-                time.sleep(time_scale / PHYSICS_HZ)
-
-                prev_obs_dict = obs_dict
-                obs_dict = get_observation(sim, drone_id)
-                obs = obs_to_vector(obs_dict)
+                obs, reward, terminated, truncated, _ = env.step(action)
+                total_r += reward
                 steps += 1
 
-                terminated, truncated, reason = check_episode_end(
-                    obs_dict, steps, total_gates, max_dist_gate_cm
-                )
-                done = terminated or truncated
+                if steps <= 5 or steps % 50 == 1:
+                    des_roll, des_pitch, yaw_rate, throttle = action_to_commands(action)
+                    odict = env._prev_obs_dict or {}
+                    print(f"  [t={steps}] thr={throttle:.3f} "
+                          f"pos=({odict.get('x',0):.0f},{odict.get('y',0):.0f},{odict.get('z',0):.0f})")
 
-                total_r += compute_reward(obs_dict, prev_obs_dict, done, reason)
-                if done:
+                if terminated or truncated:
                     break
 
-            print(f"[play EP {ep}] {reason=} steps={steps} gates={obs_dict['gates_passed']}/{total_gates} reward={total_r:.1f}")
-            drone_id = reset_race_session(sim)
-            sim.hold()
-
-        sim.stop()
-        remove_all_aircraft(sim)
+            odict = env._prev_obs_dict or {}
+            gp = odict.get("gates_passed", 0)
+            print(f"[play EP {ep}] steps={steps} gates={gp} reward={total_r:.1f}")
+    finally:
+        env.close()
 
 
 # --- Optuna hyperparameter search ---
