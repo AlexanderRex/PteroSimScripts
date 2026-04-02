@@ -5,23 +5,22 @@ Architecture (free-run):
   Simulation runs continuously at PHYSICS_HZ × time_scale.
   RL agent sends raw motor commands and reads observations via gRPC.
   No step_once — physics never pauses during training.
-    → gRPC set_actuator_controls (4 motors + 1 pad)
+    → gRPC set_actuator_controls (N channels from aircraft config)
     → JSBSim motors at 1000 Hz (continuous)
     → gRPC get observations (async read)
 
-Action space:
-  4 motors, each [-1, 1] mapped to throttle [0, 1]
-  action_to_throttles(a) = (a + 1) / 2
+Action space (4-dim policy output u in [-1, 1]):
+  Delta around trim hover throttle (Genesis-style): for each motor i,
+    throttle_i = clip(HOVER_THROTTLE + ACTION_DELTA_MAX * u_i, 0, 1)
+  Extra actuator channels (if any) are set to 0.
+  prev_action in observations is the policy output u (not raw throttle).
 
-Observation (19 dims):
-  pos_err(3): (target - drone_pos) in cm, normalized by 500 cm
-  vel(3):     velocity in cm/s, approx as delta_pos / agent_dt, normalized by 500 cm/s
-  att(3):     roll, pitch, yaw in radians, normalized by pi
-  gyro(3):    angular velocity rad/s from IMU, normalized by 10 rad/s
-  accel(3):   specific force m/s^2 from IMU, normalized by 20 m/s^2
-  prev_action(4): last motor command [-1, 1]
+Observation (19 dims): unchanged layout; prev_action = last u.
 
-Target: hover at TARGET_Z_CM above the spawn point.
+Target: (spawn_x, spawn_y, spawn_z + HOVER_HEIGHT_ABOVE_SPAWN_CM).
+
+Checkpoint note: policies trained with absolute-throttle semantics are incompatible
+with delta-throttle semantics — retrain from scratch after this change.
 
 Usage:
   python run_rl_hover_train.py --timesteps 500000
@@ -35,6 +34,7 @@ TensorBoard:
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from typing import Any
 
@@ -64,9 +64,14 @@ try:
             self._ep_count = 0
             self._last_print = 0
             self._recent_rewards: list[float] = []
+            self._reason_counts: dict[str, int] = {}
 
         def _on_training_start(self) -> None:
             self._start_time = time.monotonic()
+            self._ep_count = 0
+            self._last_print = 0
+            self._recent_rewards.clear()
+            self._reason_counts = {}
 
         def _on_step(self) -> bool:
             # Track episode rewards from Monitor wrapper infos
@@ -75,6 +80,12 @@ try:
                 if isinstance(info, dict) and "episode" in info:
                     self._recent_rewards.append(info["episode"]["r"])
                     self._ep_count += 1
+                    reason = info.get("reason")
+                    ep = info.get("episode")
+                    if reason is None and isinstance(ep, dict):
+                        reason = ep.get("reason")
+                    if isinstance(reason, str) and reason:
+                        self._reason_counts[reason] = self._reason_counts.get(reason, 0) + 1
 
             if self.num_timesteps - self._last_print >= self._print_freq:
                 self._last_print = self.num_timesteps
@@ -91,13 +102,21 @@ try:
                     ep_rew = float("nan")
                     ep_len_str = ""
 
+                reason_str = (
+                    " ".join(f"{k}={v}" for k, v in sorted(self._reason_counts.items()))
+                    if self._reason_counts
+                    else ""
+                )
+
                 pct = 100.0 * self.num_timesteps / self._total
                 print(
                     f"[{pct:5.1f}%] steps={self.num_timesteps}/{self._total} "
                     f"eps={self._ep_count} fps={fps:.0f} "
                     f"ep_rew={ep_rew:.1f}{ep_len_str} "
+                    f"{reason_str} "
                     f"ETA={eta_min:.1f}min"
                 )
+                self._reason_counts = {}
             return True
 
 except ImportError:
@@ -112,21 +131,28 @@ except ImportError:
 DEFAULT_SIM_ADDRESS = "localhost:10010"
 DEFAULT_AIRCRAFT_CLASS = "F450"
 
-DRONE_SPAWN = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
+SPAWN_Z_CM = 100.0
+HOVER_HEIGHT_ABOVE_SPAWN_CM = 200.0
+
+DRONE_SPAWN = {"x": 0.0, "y": 0.0, "z": SPAWN_Z_CM, "yaw": 0.0}
 
 PHYSICS_HZ = 1000.0
 DEFAULT_TIME_SCALE = 50.0   # sim speed multiplier for training
 AGENT_DT_S = 0.05           # 20 Hz agent (in sim-seconds)
 
-# Target hover: 300 cm above spawn in UE Z
-TARGET_Z_CM = 300.0
+# Delta action: throttle_i = clip(HOVER_THROTTLE + ACTION_DELTA_MAX * u_i, 0, 1), u_i in [-1, 1]
+HOVER_THROTTLE = 0.4
+ACTION_DELTA_MAX = 0.15
 
 # Episode
 MAX_EPISODE_STEPS = 400      # 400 * 0.05s = 20 sim-seconds
-GRACE_STEPS = 10             # don't penalize distance at start
+GRACE_STEPS = 10             # skip tilt/low/dist checks for the first N steps
 
 # Termination
-MAX_DIST_FROM_TARGET_CM = 1000.0   # 10 m — unrecoverable
+MAX_DIST_FROM_TARGET_CM = 700.0   # 7 m — unrecoverable
+TILT_MAX_DEG = 65.0
+# Terminate if world Z drops below spawn Z + this margin (cm)
+MIN_CLEARANCE_ABOVE_SPAWN_CM = 0.0
 
 # Observation
 OBS_DIM = 19
@@ -137,34 +163,46 @@ NORM_GYRO = 10.0       # rad/s
 NORM_ACCEL = 20.0      # m/s^2
 OBS_CLIP = 5.0
 
-# Reward defaults — Optuna will override these
-REWARD_DEFAULTS = {
-    "hover_bonus": 1.6450277666478557,
-    "target_radius_cm": 70.20363165296166,
-    "approach_scale": 0.009159851416012265,
-    "dist_penalty_scale": 0.0005064987258652189,
-    "crash_penalty": -11.261146126723233,
-    "timeout_penalty": -5.339290723709102,
-    "action_smooth_coef": 0.07201320586064817,
+# Reward weights (tune here). Terminal keys apply only on the final step of an episode.
+REWARD_WEIGHTS: dict[str, float] = {
+    "living_bonus": 0.18,
+    "pos_xy_penalty_scale": 0.0018,
+    "pos_z_penalty_scale": 0.0018,
+    "target_radius_cm": 60.0,
+    "target_ball_bonus": 1.4,
+    "attitude_penalty_scale": 0.7,
+    "yaw_hold_scale": 0.035,
+    "gyro_penalty_scale": 0.04,
+    "action_smooth_coef": 0.15,
+    "crash_penalty": -40.0,
+    "drift_penalty": -26.0,
+    "tilt_penalty": -18.0,
+    "low_penalty": -14.0,
+    "timeout_reward": 10.0,
 }
-
-# Active reward config (mutable — Optuna overwrites before each trial)
-reward_config: dict[str, float] = dict(REWARD_DEFAULTS)
-
-# Initial motor command. F450 hover ~0.425 throttle => action ~-0.15 via (a+1)/2.
-HOVER_ACTION = -0.15
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def action_to_throttles(action: np.ndarray, num_channels: int = 5) -> list[float]:
-    """Map [-1, 1]^4 to throttle [0, 1] and pad to num_channels."""
-    throttles = ((np.clip(action, -1.0, 1.0) + 1.0) / 2.0).tolist()
-    while len(throttles) < num_channels:
-        throttles.append(0.0)
-    return throttles
+
+def angle_wrap_rad(delta_rad: float) -> float:
+    return float(math.atan2(math.sin(delta_rad), math.cos(delta_rad)))
+
+
+def policy_to_actuator_controls(policy_u: np.ndarray, num_channels: int) -> list[float]:
+    """Map policy output u in [-1,1]^4 to per-motor throttle; pad/truncate to num_channels."""
+    u = np.clip(np.asarray(policy_u, dtype=np.float64), -1.0, 1.0)
+    motors = [
+        float(np.clip(HOVER_THROTTLE + ACTION_DELTA_MAX * float(u[i]), 0.0, 1.0))
+        for i in range(4)
+    ]
+    n_m = min(4, max(0, num_channels))
+    out = motors[:n_m]
+    while len(out) < num_channels:
+        out.append(0.0)
+    return [float(x) for x in out]
 
 
 def wait_for_aircraft_status(
@@ -278,13 +316,21 @@ if gym is not None and spaces is not None:
 
             self._sim: PteroSim | None = None
             self._drone_id = 0
-            self._target = np.array([
-                DRONE_SPAWN["x"], DRONE_SPAWN["y"], TARGET_Z_CM
-            ], dtype=np.float32)
+            self._num_channels = 5
+            self._spawn_yaw_rad = float(np.radians(DRONE_SPAWN["yaw"]))
+            self._low_z_threshold = float(DRONE_SPAWN["z"]) + MIN_CLEARANCE_ABOVE_SPAWN_CM
+            self._target = np.array(
+                [
+                    DRONE_SPAWN["x"],
+                    DRONE_SPAWN["y"],
+                    DRONE_SPAWN["z"] + HOVER_HEIGHT_ABOVE_SPAWN_CM,
+                ],
+                dtype=np.float32,
+            )
 
             self._step_count = 0
             self._prev_pos: np.ndarray | None = None
-            self._prev_action = np.full(4, HOVER_ACTION, dtype=np.float32)
+            self._prev_action = np.zeros(4, dtype=np.float32)
             self._episode_reward = 0.0
             self._setup_done = False
 
@@ -308,6 +354,11 @@ if gym is not None and spaces is not None:
                 self._drone_id = drone.instance_id
                 self._sim.start()
                 wait_for_aircraft_status(self._sim, self._drone_id)
+                try:
+                    cfg = self._sim.get_actuator_configuration(self._drone_id)
+                    self._num_channels = int(getattr(cfg, "channel_count", self._num_channels))
+                except Exception:
+                    pass
                 # Disable attitude controller — raw motor control
                 self._sim.set_attitude_command(
                     self._drone_id,
@@ -320,19 +371,24 @@ if gym is not None and spaces is not None:
                 self._sim.stop()
                 self._sim.start()
                 wait_for_aircraft_status(self._sim, self._drone_id)
+                try:
+                    cfg = self._sim.get_actuator_configuration(self._drone_id)
+                    self._num_channels = int(getattr(cfg, "channel_count", self._num_channels))
+                except Exception:
+                    pass
                 self._sim.set_attitude_command(
                     self._drone_id,
                     roll_rad=0.0, pitch_rad=0.0,
                     yaw_rate_rad_sec=0.0, throttle=0.0, enabled=False,
                 )
 
-            # Seed hover throttle
-            hover_t = action_to_throttles(np.full(4, HOVER_ACTION, dtype=np.float32))
+            neutral_u = np.zeros(4, dtype=np.float32)
+            hover_t = policy_to_actuator_controls(neutral_u, self._num_channels)
             self._sim.set_actuator_controls(self._drone_id, hover_t)
 
             self._step_count = 0
             self._prev_pos = None
-            self._prev_action = np.full(4, HOVER_ACTION, dtype=np.float32)
+            self._prev_action = neutral_u.copy()
             self._episode_reward = 0.0
 
             raw = get_obs_raw(self._sim, self._drone_id)
@@ -344,9 +400,10 @@ if gym is not None and spaces is not None:
             self._step_count += 1
             action = np.asarray(action, dtype=np.float32)
 
-            # Send motor commands
+            # Send motor commands (policy = delta around HOVER_THROTTLE)
             self._sim.set_actuator_controls(
-                self._drone_id, action_to_throttles(action)
+                self._drone_id,
+                policy_to_actuator_controls(action, self._num_channels),
             )
 
             # Let physics run
@@ -366,38 +423,81 @@ if gym is not None and spaces is not None:
             else:
                 pos = np.array([raw["x"], raw["y"], raw["z"]], dtype=np.float32)
                 dist = float(np.linalg.norm(pos - self._target))
+                roll_deg = float(raw["roll_deg"])
+                pitch_deg = float(raw["pitch_deg"])
+                tilt_max = max(abs(roll_deg), abs(pitch_deg))
 
-                if self._step_count > GRACE_STEPS and dist > MAX_DIST_FROM_TARGET_CM:
-                    terminated = True
-                    reason = "too_far"
-                elif self._step_count >= MAX_EPISODE_STEPS:
+                if self._step_count > GRACE_STEPS:
+                    if tilt_max > TILT_MAX_DEG:
+                        terminated = True
+                        reason = "tilt"
+                    elif float(pos[2]) < self._low_z_threshold:
+                        terminated = True
+                        reason = "low"
+                    elif dist > MAX_DIST_FROM_TARGET_CM:
+                        terminated = True
+                        reason = "too_far"
+
+                if not terminated and self._step_count >= MAX_EPISODE_STEPS:
                     truncated = True
                     reason = "timeout"
 
             # Reward
             done = terminated or truncated
             if reason == "crash":
-                reward = reward_config["crash_penalty"]
+                reward = REWARD_WEIGHTS["crash_penalty"]
             elif reason == "too_far":
-                reward = reward_config["crash_penalty"]
+                reward = REWARD_WEIGHTS["drift_penalty"]
+            elif reason == "tilt":
+                reward = REWARD_WEIGHTS["tilt_penalty"]
+            elif reason == "low":
+                reward = REWARD_WEIGHTS["low_penalty"]
             elif reason == "timeout":
-                reward = reward_config["timeout_penalty"]
+                reward = REWARD_WEIGHTS["timeout_reward"]
             else:
                 pos = np.array([raw["x"], raw["y"], raw["z"]], dtype=np.float32)
-                dist = float(np.linalg.norm(pos - self._target))
+                err = self._target - pos
+                dist_xy = float(math.sqrt(err[0] ** 2 + err[1] ** 2))
+                dist_abs_z = abs(float(err[2]))
+                dist = float(np.linalg.norm(err))
 
-                # Approach reward
-                approach = 0.0
-                if self._prev_pos is not None:
-                    prev_dist = float(np.linalg.norm(self._prev_pos - self._target))
-                    approach = (prev_dist - dist) * reward_config["approach_scale"]
+                pos_penalty = -(
+                    REWARD_WEIGHTS["pos_xy_penalty_scale"] * dist_xy
+                    + REWARD_WEIGHTS["pos_z_penalty_scale"] * dist_abs_z
+                )
 
-                hover_bonus = reward_config["hover_bonus"] if dist < reward_config["target_radius_cm"] else 0.0
-                dist_penalty = -reward_config["dist_penalty_scale"] * dist
-                smooth_pen = -reward_config["action_smooth_coef"] * float(
+                ball = (
+                    REWARD_WEIGHTS["target_ball_bonus"]
+                    if dist < REWARD_WEIGHTS["target_radius_cm"]
+                    else 0.0
+                )
+
+                roll_r = math.radians(float(raw["roll_deg"]))
+                pitch_r = math.radians(float(raw["pitch_deg"]))
+                att_pen = -REWARD_WEIGHTS["attitude_penalty_scale"] * (
+                    roll_r**2 + pitch_r**2
+                )
+
+                yaw_r = np.radians(float(raw["yaw_deg"]))
+                yaw_err = angle_wrap_rad(float(yaw_r) - self._spawn_yaw_rad)
+                yaw_pen = -REWARD_WEIGHTS["yaw_hold_scale"] * (yaw_err**2)
+
+                gyro = np.asarray(raw["gyro"], dtype=np.float64)
+                gyro_pen = -REWARD_WEIGHTS["gyro_penalty_scale"] * float(np.sum(gyro**2))
+
+                smooth_pen = -REWARD_WEIGHTS["action_smooth_coef"] * float(
                     np.sum(np.abs(action - self._prev_action))
                 )
-                reward = approach + hover_bonus + dist_penalty + smooth_pen
+
+                reward = (
+                    REWARD_WEIGHTS["living_bonus"]
+                    + pos_penalty
+                    + ball
+                    + att_pen
+                    + yaw_pen
+                    + gyro_pen
+                    + smooth_pen
+                )
 
             self._episode_reward += reward
 
@@ -416,6 +516,7 @@ if gym is not None and spaces is not None:
                 info["episode"] = {
                     "r": self._episode_reward,
                     "l": self._step_count,
+                    "reason": reason,
                 }
                 info["reason"] = reason
 
@@ -571,7 +672,7 @@ def run_play(
                 steps += 1
 
                 if steps % 20 == 0:
-                    thr = action_to_throttles(action)
+                    thr = policy_to_actuator_controls(action, getattr(env, "_num_channels", 5))
                     print(
                         f"  step={steps} r={total_r:.2f} "
                         f"thr=[{thr[0]:.2f},{thr[1]:.2f},{thr[2]:.2f},{thr[3]:.2f}]"
@@ -626,22 +727,33 @@ def run_optuna(
         gradient_steps = trial.suggest_categorical("gradient_steps", [1, 2, 4])
         net_arch_size = trial.suggest_categorical("net_arch_size", [128, 256, 512])
 
-        # --- Sample reward coefficients ---
-        reward_config["hover_bonus"] = trial.suggest_float("hover_bonus", 0.1, 5.0)
-        reward_config["target_radius_cm"] = trial.suggest_float("target_radius_cm", 20.0, 200.0)
-        reward_config["approach_scale"] = trial.suggest_float("approach_scale", 0.0005, 0.01, log=True)
-        reward_config["dist_penalty_scale"] = trial.suggest_float("dist_penalty_scale", 0.0005, 0.01, log=True)
-        reward_config["crash_penalty"] = trial.suggest_float("crash_penalty", -100.0, -10.0)
-        reward_config["timeout_penalty"] = trial.suggest_float("timeout_penalty", -30.0, -1.0)
-        reward_config["action_smooth_coef"] = trial.suggest_float("action_smooth_coef", 0.01, 0.2)
+        # --- Sample reward coefficients (writes into global REWARD_WEIGHTS) ---
+        REWARD_WEIGHTS["living_bonus"] = trial.suggest_float("living_bonus", 0.05, 0.35)
+        REWARD_WEIGHTS["pos_xy_penalty_scale"] = trial.suggest_float(
+            "pos_xy_penalty_scale", 0.0001, 0.002, log=True
+        )
+        REWARD_WEIGHTS["pos_z_penalty_scale"] = trial.suggest_float(
+            "pos_z_penalty_scale", 0.0003, 0.003, log=True
+        )
+        REWARD_WEIGHTS["target_radius_cm"] = trial.suggest_float("target_radius_cm", 20.0, 200.0)
+        REWARD_WEIGHTS["target_ball_bonus"] = trial.suggest_float("target_ball_bonus", 0.2, 4.0)
+        REWARD_WEIGHTS["attitude_penalty_scale"] = trial.suggest_float(
+            "attitude_penalty_scale", 0.05, 0.8
+        )
+        REWARD_WEIGHTS["gyro_penalty_scale"] = trial.suggest_float(
+            "gyro_penalty_scale", 0.01, 0.12, log=True
+        )
+        REWARD_WEIGHTS["crash_penalty"] = trial.suggest_float("crash_penalty", -100.0, -10.0)
+        REWARD_WEIGHTS["drift_penalty"] = trial.suggest_float("drift_penalty", -60.0, -5.0)
+        REWARD_WEIGHTS["action_smooth_coef"] = trial.suggest_float("action_smooth_coef", 0.01, 0.2)
 
         print(f"\n--- Trial {trial.number} ---")
         print(f"  lr={lr:.1e} gamma={gamma:.4f} tau={tau:.4f} batch={batch_size} "
               f"train_freq={train_freq} grad_steps={gradient_steps} arch={net_arch_size}")
-        print(f"  hover_bonus={reward_config['hover_bonus']:.2f} "
-              f"approach={reward_config['approach_scale']:.4f} "
-              f"crash={reward_config['crash_penalty']:.0f} "
-              f"smooth={reward_config['action_smooth_coef']:.3f}")
+        print(f"  living={REWARD_WEIGHTS['living_bonus']:.3f} ball={REWARD_WEIGHTS['target_ball_bonus']:.2f} "
+              f"w_z={REWARD_WEIGHTS['pos_z_penalty_scale']:.5f} "
+              f"crash={REWARD_WEIGHTS['crash_penalty']:.0f} "
+              f"smooth={REWARD_WEIGHTS['action_smooth_coef']:.3f}")
 
         env = Monitor(PteroHoverEnv(
             sim_address=sim_addr,
