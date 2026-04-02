@@ -7,6 +7,7 @@ Python scripts and examples for [PteroSim](https://github.com/PteroLabsAI/PteroS
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
 - [Virtual Environment](#virtual-environment)
+- [Git Hooks](#git-hooks)
 
 ## Prerequisites
 
@@ -38,3 +39,11 @@ python examples/hello_drone.py
 | Deactivate | `deactivate` |
 | Remove (Linux/macOS) | `rm -rf <env_name>` |
 | Remove (Windows) | `rmdir /s /q <env_name>` |
+
+## Git Hooks
+
+Enable pre-commit linting with Ruff:
+
+```bash
+git config core.hooksPath .githooks
+```
