@@ -1,5 +1,5 @@
 """
-Single-drone SAC hover trainer for PteroSim — raw motor control (no PID).
+Single-drone PPO hover trainer for PteroSim — raw motor control (no PID).
 
 Architecture (free-run):
   Simulation runs continuously at PHYSICS_HZ × time_scale.
@@ -21,11 +21,14 @@ Target: (spawn_x, spawn_y, spawn_z + HOVER_HEIGHT_ABOVE_SPAWN_CM).
 
 Checkpoint note: policies trained with absolute-throttle semantics are incompatible
 with delta-throttle semantics — retrain from scratch after this change.
+PPO .zip archives are not loadable as SAC and vice versa.
 
 Usage:
   python run_rl_hover_train.py --timesteps 500000
-  python run_rl_hover_train.py --timesteps 500000 --load checkpoints/sac_hover.zip
-  python run_rl_hover_train.py --mode play --load checkpoints/sac_hover.zip
+  python run_rl_hover_train.py --timesteps 500000 --load checkpoints/ppo_hover.zip
+  python run_rl_hover_train.py --mode play --load checkpoints/ppo_hover.zip
+
+Note: PPO and SAC checkpoints are not interchangeable.
 
 TensorBoard:
   tensorboard --logdir tensorboard_logs
@@ -141,18 +144,15 @@ DEFAULT_TIME_SCALE = 50.0   # sim speed multiplier for training
 AGENT_DT_S = 0.05           # 20 Hz agent (in sim-seconds)
 
 # Delta action: throttle_i = clip(HOVER_THROTTLE + ACTION_DELTA_MAX * u_i, 0, 1), u_i in [-1, 1]
-HOVER_THROTTLE = 0.4
-ACTION_DELTA_MAX = 0.15
+HOVER_THROTTLE = 0.43
+ACTION_DELTA_MAX = 0.05
 
 # Episode
 MAX_EPISODE_STEPS = 400      # 400 * 0.05s = 20 sim-seconds
-GRACE_STEPS = 10             # skip tilt/low/dist checks for the first N steps
 
 # Termination
 MAX_DIST_FROM_TARGET_CM = 700.0   # 7 m — unrecoverable
 TILT_MAX_DEG = 65.0
-# Terminate if world Z drops below spawn Z + this margin (cm)
-MIN_CLEARANCE_ABOVE_SPAWN_CM = 0.0
 
 # Observation
 OBS_DIM = 19
@@ -164,20 +164,28 @@ NORM_ACCEL = 20.0      # m/s^2
 OBS_CLIP = 5.0
 
 # Reward weights (tune here). Terminal keys apply only on the final step of an episode.
+# progress_coef is kept small so the policy is not rewarded for a short "lunge" toward
+# target then dying; caps on attitude/gyro still limit runaway per-step cost in bad pose.
+#
+# Episodes often sit ~200cm below target early: pos_z alone was ~-0.42/step vs living 0.22,
+# so net per-step was negative and SHORT episodes looked "better" on ep_rew_mean — raise
+# living_bonus and ease pos_z so extra survival steps are not automatically punished harder.
 REWARD_WEIGHTS: dict[str, float] = {
-    "living_bonus": 0.18,
-    "pos_xy_penalty_scale": 0.0018,
-    "pos_z_penalty_scale": 0.0018,
+    "living_bonus": 0.4,
+    "progress_coef": 0.0012,
+    "pos_xy_penalty_scale": 0.0009,
+    "pos_z_penalty_scale": 0.001,
     "target_radius_cm": 60.0,
     "target_ball_bonus": 1.4,
-    "attitude_penalty_scale": 0.7,
-    "yaw_hold_scale": 0.035,
-    "gyro_penalty_scale": 0.04,
-    "action_smooth_coef": 0.15,
+    "attitude_penalty_scale": 0.32,
+    "attitude_sq_cap_rad2": 0.35,
+    "yaw_hold_scale": 0.018,
+    "gyro_penalty_scale": 0.02,
+    "gyro_sq_cap": 12.0,
+    "action_smooth_coef": 0.09,
     "crash_penalty": -40.0,
     "drift_penalty": -26.0,
     "tilt_penalty": -18.0,
-    "low_penalty": -14.0,
     "timeout_reward": 10.0,
 }
 
@@ -318,7 +326,6 @@ if gym is not None and spaces is not None:
             self._drone_id = 0
             self._num_channels = 5
             self._spawn_yaw_rad = float(np.radians(DRONE_SPAWN["yaw"]))
-            self._low_z_threshold = float(DRONE_SPAWN["z"]) + MIN_CLEARANCE_ABOVE_SPAWN_CM
             self._target = np.array(
                 [
                     DRONE_SPAWN["x"],
@@ -333,6 +340,7 @@ if gym is not None and spaces is not None:
             self._prev_action = np.zeros(4, dtype=np.float32)
             self._episode_reward = 0.0
             self._setup_done = False
+            self._prev_dist: float | None = None
 
         def _connect(self) -> None:
             if self._sim is not None:
@@ -390,6 +398,7 @@ if gym is not None and spaces is not None:
             self._prev_pos = None
             self._prev_action = neutral_u.copy()
             self._episode_reward = 0.0
+            self._prev_dist = None
 
             raw = get_obs_raw(self._sim, self._drone_id)
             obs = build_obs(raw, self._target, None, self._prev_action)
@@ -427,16 +436,12 @@ if gym is not None and spaces is not None:
                 pitch_deg = float(raw["pitch_deg"])
                 tilt_max = max(abs(roll_deg), abs(pitch_deg))
 
-                if self._step_count > GRACE_STEPS:
-                    if tilt_max > TILT_MAX_DEG:
-                        terminated = True
-                        reason = "tilt"
-                    elif float(pos[2]) < self._low_z_threshold:
-                        terminated = True
-                        reason = "low"
-                    elif dist > MAX_DIST_FROM_TARGET_CM:
-                        terminated = True
-                        reason = "too_far"
+                if tilt_max > TILT_MAX_DEG:
+                    terminated = True
+                    reason = "tilt"
+                elif dist > MAX_DIST_FROM_TARGET_CM:
+                    terminated = True
+                    reason = "too_far"
 
                 if not terminated and self._step_count >= MAX_EPISODE_STEPS:
                     truncated = True
@@ -450,8 +455,6 @@ if gym is not None and spaces is not None:
                 reward = REWARD_WEIGHTS["drift_penalty"]
             elif reason == "tilt":
                 reward = REWARD_WEIGHTS["tilt_penalty"]
-            elif reason == "low":
-                reward = REWARD_WEIGHTS["low_penalty"]
             elif reason == "timeout":
                 reward = REWARD_WEIGHTS["timeout_reward"]
             else:
@@ -460,6 +463,12 @@ if gym is not None and spaces is not None:
                 dist_xy = float(math.sqrt(err[0] ** 2 + err[1] ** 2))
                 dist_abs_z = abs(float(err[2]))
                 dist = float(np.linalg.norm(err))
+
+                progress_bonus = 0.0
+                if self._prev_dist is not None:
+                    progress_bonus = REWARD_WEIGHTS["progress_coef"] * max(
+                        0.0, float(self._prev_dist) - dist
+                    )
 
                 pos_penalty = -(
                     REWARD_WEIGHTS["pos_xy_penalty_scale"] * dist_xy
@@ -474,16 +483,18 @@ if gym is not None and spaces is not None:
 
                 roll_r = math.radians(float(raw["roll_deg"]))
                 pitch_r = math.radians(float(raw["pitch_deg"]))
-                att_pen = -REWARD_WEIGHTS["attitude_penalty_scale"] * (
-                    roll_r**2 + pitch_r**2
-                )
+                att_sq = roll_r**2 + pitch_r**2
+                att_sq = min(att_sq, float(REWARD_WEIGHTS["attitude_sq_cap_rad2"]))
+                att_pen = -REWARD_WEIGHTS["attitude_penalty_scale"] * att_sq
 
                 yaw_r = np.radians(float(raw["yaw_deg"]))
                 yaw_err = angle_wrap_rad(float(yaw_r) - self._spawn_yaw_rad)
                 yaw_pen = -REWARD_WEIGHTS["yaw_hold_scale"] * (yaw_err**2)
 
                 gyro = np.asarray(raw["gyro"], dtype=np.float64)
-                gyro_pen = -REWARD_WEIGHTS["gyro_penalty_scale"] * float(np.sum(gyro**2))
+                gyro_sq = float(np.sum(gyro**2))
+                gyro_sq = min(gyro_sq, float(REWARD_WEIGHTS["gyro_sq_cap"]))
+                gyro_pen = -REWARD_WEIGHTS["gyro_penalty_scale"] * gyro_sq
 
                 smooth_pen = -REWARD_WEIGHTS["action_smooth_coef"] * float(
                     np.sum(np.abs(action - self._prev_action))
@@ -491,6 +502,7 @@ if gym is not None and spaces is not None:
 
                 reward = (
                     REWARD_WEIGHTS["living_bonus"]
+                    + progress_bonus
                     + pos_penalty
                     + ball
                     + att_pen
@@ -498,6 +510,8 @@ if gym is not None and spaces is not None:
                     + gyro_pen
                     + smooth_pen
                 )
+
+                self._prev_dist = dist
 
             self._episode_reward += reward
 
@@ -552,11 +566,17 @@ def run_train(
         raise SystemExit("Install gymnasium: pip install gymnasium")
 
     from pathlib import Path
-    from stable_baselines3 import SAC
+    from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
     from stable_baselines3.common.monitor import Monitor
 
-    Path("checkpoints").mkdir(parents=True, exist_ok=True)
+    # --save path without .zip: same stem/dir for periodic checkpoints and final .zip
+    save_base = Path(save_path).expanduser()
+    if save_base.suffix.lower() == ".zip":
+        save_base = save_base.with_suffix("")
+    save_base.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = str(save_base.parent)
+    checkpoint_prefix = save_base.name
 
     env = Monitor(PteroHoverEnv(
         sim_address=sim_addr,
@@ -564,6 +584,7 @@ def run_train(
         time_scale=time_scale,
     ))
 
+    model: PPO | None = None
     try:
         if tensorboard_log:
             Path(tensorboard_log).mkdir(parents=True, exist_ok=True)
@@ -575,31 +596,28 @@ def run_train(
             if not lp.is_file():
                 raise SystemExit(f"Checkpoint not found: {load_path}")
 
-            model = SAC.load(str(lp), env=env, verbose=1,
-                             tensorboard_log=tensorboard_log or None)
+            model = PPO.load(
+                str(lp), env=env, verbose=1, tensorboard_log=tensorboard_log or None
+            )
             print(f"Loaded from {lp}")
-
-            # Load replay buffer if exists
-            rb_path = Path(str(lp).replace(".zip", "_replay_buffer.pkl"))
-            if rb_path.is_file():
-                model.load_replay_buffer(str(rb_path))
-                print(f"Loaded replay buffer ({model.replay_buffer.size()} transitions)")
             reset_num = False
         else:
-            model = SAC(
+            # n_steps: rollout length per update; smaller => more frequent updates on slow sim
+            model = PPO(
                 policy="MlpPolicy",
                 env=env,
                 verbose=1,
                 seed=seed,
-                learning_rate=2.9873903952202896e-05,
-                buffer_size=200_000,
-                batch_size=128,
-                tau=0.01625829984594192,
-                gamma=0.9509454422913205,
-                train_freq=8,
-                gradient_steps=4,
-                learning_starts=2000,
-                ent_coef="auto",            # auto entropy tuning
+                learning_rate=3e-4,
+                n_steps=1024,
+                batch_size=64,
+                n_epochs=10,
+                gamma=0.99,
+                gae_lambda=0.95,
+                clip_range=0.2,
+                ent_coef=0.01,
+                vf_coef=0.5,
+                max_grad_norm=0.5,
                 policy_kwargs={"net_arch": [256, 256]},
                 tensorboard_log=tensorboard_log or None,
             )
@@ -612,21 +630,30 @@ def run_train(
             callbacks.append(ProgressCallback(progress_total))
         callbacks.append(CheckpointCallback(
             save_freq=10_000,
-            save_path="checkpoints/",
-            name_prefix="sac_hover",
-            save_replay_buffer=True,
+            save_path=checkpoint_dir,
+            name_prefix=checkpoint_prefix,
+            save_replay_buffer=False,
         ))
 
-        model.learn(
-            total_timesteps=timesteps,
-            tb_log_name=run_name,
-            reset_num_timesteps=reset_num,
-            callback=CallbackList(callbacks),
-        )
-        model.save(save_path)
-        model.save_replay_buffer(f"{save_path}_replay_buffer")
-        print(f"Saved policy to {save_path}.zip")
-        print(f"Saved replay buffer to {save_path}_replay_buffer.pkl")
+        interrupted = False
+        try:
+            model.learn(
+                total_timesteps=timesteps,
+                tb_log_name=run_name,
+                reset_num_timesteps=reset_num,
+                callback=CallbackList(callbacks),
+            )
+        except KeyboardInterrupt:
+            interrupted = True
+            print("KeyboardInterrupt — saving latest policy before exit")
+        finally:
+            if model is not None:
+                final_path = str(save_base)
+                model.save(final_path)
+                print(f"Saved policy to {final_path}.zip")
+            if interrupted:
+                raise KeyboardInterrupt
+
         if tensorboard_log:
             print(f"TensorBoard: tensorboard --logdir {tensorboard_log}")
     finally:
@@ -644,7 +671,7 @@ def run_play(
     time_scale: float = 1.0,
 ) -> None:
     from pathlib import Path
-    from stable_baselines3 import SAC
+    from stable_baselines3 import PPO
 
     lp = Path(load_path)
     if not lp.is_file():
@@ -657,7 +684,7 @@ def run_play(
         aircraft_class=aircraft,
         time_scale=time_scale,
     )
-    model = SAC.load(str(lp))
+    model = PPO.load(str(lp))
 
     try:
         while True:
@@ -699,7 +726,7 @@ def run_optuna(
     timesteps_per_trial: int,
     time_scale: float,
     seed: int | None,
-    study_name: str = "hover_sac",
+    study_name: str = "hover_ppo",
     storage: str | None = None,
 ) -> None:
     try:
@@ -711,24 +738,26 @@ def run_optuna(
         raise SystemExit("Install gymnasium: pip install gymnasium")
 
     from pathlib import Path
-    from stable_baselines3 import SAC
+    from stable_baselines3 import PPO
     from stable_baselines3.common.monitor import Monitor
 
     Path("optuna_checkpoints").mkdir(parents=True, exist_ok=True)
     Path("tensorboard_logs").mkdir(parents=True, exist_ok=True)
 
     def objective(trial: optuna.Trial) -> float:
-        # --- Sample SAC hyperparameters ---
+        # --- Sample PPO hyperparameters ---
         lr = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
         gamma = trial.suggest_float("gamma", 0.95, 0.999)
-        tau = trial.suggest_float("tau", 0.005, 0.05, log=True)
-        batch_size = trial.suggest_categorical("batch_size", [128, 256, 512])
-        train_freq = trial.suggest_categorical("train_freq", [1, 2, 4, 8])
-        gradient_steps = trial.suggest_categorical("gradient_steps", [1, 2, 4])
+        gae_lambda = trial.suggest_float("gae_lambda", 0.9, 0.99)
+        clip_range = trial.suggest_float("clip_range", 0.1, 0.3)
+        ent_coef = trial.suggest_float("ent_coef", 0.0, 0.02)
+        n_steps = trial.suggest_categorical("n_steps", [512, 1024, 2048])
+        batch_size = trial.suggest_categorical("batch_size", [64, 128, 256])
+        n_epochs = trial.suggest_categorical("n_epochs", [5, 10, 15])
         net_arch_size = trial.suggest_categorical("net_arch_size", [128, 256, 512])
 
         # --- Sample reward coefficients (writes into global REWARD_WEIGHTS) ---
-        REWARD_WEIGHTS["living_bonus"] = trial.suggest_float("living_bonus", 0.05, 0.35)
+        REWARD_WEIGHTS["living_bonus"] = trial.suggest_float("living_bonus", 0.12, 0.55)
         REWARD_WEIGHTS["pos_xy_penalty_scale"] = trial.suggest_float(
             "pos_xy_penalty_scale", 0.0001, 0.002, log=True
         )
@@ -740,16 +769,23 @@ def run_optuna(
         REWARD_WEIGHTS["attitude_penalty_scale"] = trial.suggest_float(
             "attitude_penalty_scale", 0.05, 0.8
         )
-        REWARD_WEIGHTS["gyro_penalty_scale"] = trial.suggest_float(
-            "gyro_penalty_scale", 0.01, 0.12, log=True
+        REWARD_WEIGHTS["attitude_sq_cap_rad2"] = trial.suggest_float(
+            "attitude_sq_cap_rad2", 0.15, 0.7
         )
+        REWARD_WEIGHTS["yaw_hold_scale"] = trial.suggest_float("yaw_hold_scale", 0.005, 0.04)
+        REWARD_WEIGHTS["gyro_penalty_scale"] = trial.suggest_float(
+            "gyro_penalty_scale", 0.005, 0.08, log=True
+        )
+        REWARD_WEIGHTS["gyro_sq_cap"] = trial.suggest_float("gyro_sq_cap", 4.0, 30.0)
+        REWARD_WEIGHTS["progress_coef"] = trial.suggest_float("progress_coef", 0.0003, 0.006, log=True)
         REWARD_WEIGHTS["crash_penalty"] = trial.suggest_float("crash_penalty", -100.0, -10.0)
         REWARD_WEIGHTS["drift_penalty"] = trial.suggest_float("drift_penalty", -60.0, -5.0)
         REWARD_WEIGHTS["action_smooth_coef"] = trial.suggest_float("action_smooth_coef", 0.01, 0.2)
 
         print(f"\n--- Trial {trial.number} ---")
-        print(f"  lr={lr:.1e} gamma={gamma:.4f} tau={tau:.4f} batch={batch_size} "
-              f"train_freq={train_freq} grad_steps={gradient_steps} arch={net_arch_size}")
+        print(f"  lr={lr:.1e} gamma={gamma:.4f} gae_lambda={gae_lambda:.3f} "
+              f"clip={clip_range:.2f} ent={ent_coef:.4f} n_steps={n_steps} "
+              f"batch={batch_size} n_epochs={n_epochs} arch={net_arch_size}")
         print(f"  living={REWARD_WEIGHTS['living_bonus']:.3f} ball={REWARD_WEIGHTS['target_ball_bonus']:.2f} "
               f"w_z={REWARD_WEIGHTS['pos_z_penalty_scale']:.5f} "
               f"crash={REWARD_WEIGHTS['crash_penalty']:.0f} "
@@ -762,20 +798,19 @@ def run_optuna(
         ))
 
         try:
-            model = SAC(
+            model = PPO(
                 policy="MlpPolicy",
                 env=env,
                 verbose=0,
                 seed=seed,
                 learning_rate=lr,
-                buffer_size=200_000,
+                n_steps=n_steps,
                 batch_size=batch_size,
-                tau=tau,
+                n_epochs=n_epochs,
                 gamma=gamma,
-                train_freq=train_freq,
-                gradient_steps=gradient_steps,
-                learning_starts=1000,
-                ent_coef="auto",
+                gae_lambda=gae_lambda,
+                clip_range=clip_range,
+                ent_coef=ent_coef,
                 policy_kwargs={"net_arch": [net_arch_size, net_arch_size]},
                 tensorboard_log="tensorboard_logs",
             )
@@ -805,8 +840,7 @@ def run_optuna(
 
             mean_r = float(np.mean(ep_rewards))
             print(f"  Trial {trial.number}: mean_reward={mean_r:.1f} "
-                  f"lr={lr:.1e} gamma={gamma:.4f} tau={tau:.4f} "
-                  f"batch={batch_size} arch={net_arch_size}")
+                  f"lr={lr:.1e} n_steps={n_steps} batch={batch_size} arch={net_arch_size}")
 
             # Save best
             model.save(f"optuna_checkpoints/trial_{trial.number}")
@@ -833,16 +867,16 @@ def run_optuna(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="PteroSim SAC hover trainer — raw motor control")
+    p = argparse.ArgumentParser(description="PteroSim PPO hover trainer — raw motor control")
     p.add_argument("--mode", choices=["train", "play", "optuna"], default="train")
     p.add_argument("--sim-address", default=DEFAULT_SIM_ADDRESS)
     p.add_argument("--aircraft", default=DEFAULT_AIRCRAFT_CLASS)
     p.add_argument("--timesteps", type=int, default=500_000)
     p.add_argument("--time-scale", type=float, default=DEFAULT_TIME_SCALE)
     p.add_argument("--load", default=None, help="Path to .zip checkpoint")
-    p.add_argument("--save", default="checkpoints/sac_hover", help="Save path (no .zip)")
+    p.add_argument("--save", default="checkpoints/ppo_hover", help="Save path (no .zip)")
     p.add_argument("--tensorboard-log", default="tensorboard_logs")
-    p.add_argument("--run-name", default="sac_hover")
+    p.add_argument("--run-name", default="ppo_hover")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--optuna-trials", type=int, default=30)
     p.add_argument("--optuna-timesteps", type=int, default=30_000)
