@@ -144,8 +144,8 @@ DEFAULT_TIME_SCALE = 50.0   # sim speed multiplier for training
 AGENT_DT_S = 0.05           # 20 Hz agent (in sim-seconds)
 
 # Delta action: throttle_i = clip(HOVER_THROTTLE + ACTION_DELTA_MAX * u_i, 0, 1), u_i in [-1, 1]
-HOVER_THROTTLE = 0.43
-ACTION_DELTA_MAX = 0.05
+HOVER_THROTTLE = 0.4
+ACTION_DELTA_MAX = 0.2
 
 # Episode
 MAX_EPISODE_STEPS = 400      # 400 * 0.05s = 20 sim-seconds
@@ -164,28 +164,25 @@ NORM_ACCEL = 20.0      # m/s^2
 OBS_CLIP = 5.0
 
 # Reward weights (tune here). Terminal keys apply only on the final step of an episode.
-# progress_coef is kept small so the policy is not rewarded for a short "lunge" toward
-# target then dying; caps on attitude/gyro still limit runaway per-step cost in bad pose.
-#
-# Episodes often sit ~200cm below target early: pos_z alone was ~-0.42/step vs living 0.22,
-# so net per-step was negative and SHORT episodes looked "better" on ep_rew_mean — raise
-# living_bonus and ease pos_z so extra survival steps are not automatically punished harder.
+# Tiered location shaping: no xy/z penalties. (1) survival_bonus every alive step.
+# (2) approach_progress_coef * delta_dist toward target while outside hover_zone_radius_cm.
+# (3) hover_zone_bonus per step while dist <= hover_zone_radius_cm.
 REWARD_WEIGHTS: dict[str, float] = {
-    "living_bonus": 0.4,
-    "progress_coef": 0.0012,
-    "pos_xy_penalty_scale": 0.0009,
-    "pos_z_penalty_scale": 0.001,
-    "target_radius_cm": 60.0,
-    "target_ball_bonus": 1.4,
+    "survival_bonus": 0.12,
+    "approach_progress_coef": 0.002,
+    "hover_zone_radius_cm": 60.0,
+    "hover_zone_bonus": 0.18,
     "attitude_penalty_scale": 0.32,
     "attitude_sq_cap_rad2": 0.35,
     "yaw_hold_scale": 0.018,
     "gyro_penalty_scale": 0.02,
     "gyro_sq_cap": 12.0,
+    "accel_penalty_scale": 0.025,
+    "accel_sq_cap": 10.0,
     "action_smooth_coef": 0.09,
     "crash_penalty": -40.0,
     "drift_penalty": -26.0,
-    "tilt_penalty": -18.0,
+    "tilt_penalty": -24.0,
     "timeout_reward": 10.0,
 }
 
@@ -460,26 +457,19 @@ if gym is not None and spaces is not None:
             else:
                 pos = np.array([raw["x"], raw["y"], raw["z"]], dtype=np.float32)
                 err = self._target - pos
-                dist_xy = float(math.sqrt(err[0] ** 2 + err[1] ** 2))
-                dist_abs_z = abs(float(err[2]))
                 dist = float(np.linalg.norm(err))
+                r_hover = float(REWARD_WEIGHTS["hover_zone_radius_cm"])
+                in_hover = dist <= r_hover
 
-                progress_bonus = 0.0
-                if self._prev_dist is not None:
-                    progress_bonus = REWARD_WEIGHTS["progress_coef"] * max(
+                survival = REWARD_WEIGHTS["survival_bonus"]
+
+                approach_bonus = 0.0
+                if not in_hover and self._prev_dist is not None:
+                    approach_bonus = REWARD_WEIGHTS["approach_progress_coef"] * max(
                         0.0, float(self._prev_dist) - dist
                     )
 
-                pos_penalty = -(
-                    REWARD_WEIGHTS["pos_xy_penalty_scale"] * dist_xy
-                    + REWARD_WEIGHTS["pos_z_penalty_scale"] * dist_abs_z
-                )
-
-                ball = (
-                    REWARD_WEIGHTS["target_ball_bonus"]
-                    if dist < REWARD_WEIGHTS["target_radius_cm"]
-                    else 0.0
-                )
+                hover_bonus = REWARD_WEIGHTS["hover_zone_bonus"] if in_hover else 0.0
 
                 roll_r = math.radians(float(raw["roll_deg"]))
                 pitch_r = math.radians(float(raw["pitch_deg"]))
@@ -496,18 +486,23 @@ if gym is not None and spaces is not None:
                 gyro_sq = min(gyro_sq, float(REWARD_WEIGHTS["gyro_sq_cap"]))
                 gyro_pen = -REWARD_WEIGHTS["gyro_penalty_scale"] * gyro_sq
 
+                accel = np.asarray(raw["accel"], dtype=np.float64)
+                accel_sq = float(np.sum(accel**2))
+                accel_sq = min(accel_sq, float(REWARD_WEIGHTS["accel_sq_cap"]))
+                accel_pen = -REWARD_WEIGHTS["accel_penalty_scale"] * accel_sq
+
                 smooth_pen = -REWARD_WEIGHTS["action_smooth_coef"] * float(
                     np.sum(np.abs(action - self._prev_action))
                 )
 
                 reward = (
-                    REWARD_WEIGHTS["living_bonus"]
-                    + progress_bonus
-                    + pos_penalty
-                    + ball
+                    survival
+                    + approach_bonus
+                    + hover_bonus
                     + att_pen
                     + yaw_pen
                     + gyro_pen
+                    + accel_pen
                     + smooth_pen
                 )
 
@@ -757,15 +752,14 @@ def run_optuna(
         net_arch_size = trial.suggest_categorical("net_arch_size", [128, 256, 512])
 
         # --- Sample reward coefficients (writes into global REWARD_WEIGHTS) ---
-        REWARD_WEIGHTS["living_bonus"] = trial.suggest_float("living_bonus", 0.12, 0.55)
-        REWARD_WEIGHTS["pos_xy_penalty_scale"] = trial.suggest_float(
-            "pos_xy_penalty_scale", 0.0001, 0.002, log=True
+        REWARD_WEIGHTS["survival_bonus"] = trial.suggest_float("survival_bonus", 0.04, 0.22)
+        REWARD_WEIGHTS["approach_progress_coef"] = trial.suggest_float(
+            "approach_progress_coef", 0.0004, 0.006, log=True
         )
-        REWARD_WEIGHTS["pos_z_penalty_scale"] = trial.suggest_float(
-            "pos_z_penalty_scale", 0.0003, 0.003, log=True
+        REWARD_WEIGHTS["hover_zone_radius_cm"] = trial.suggest_float(
+            "hover_zone_radius_cm", 25.0, 120.0
         )
-        REWARD_WEIGHTS["target_radius_cm"] = trial.suggest_float("target_radius_cm", 20.0, 200.0)
-        REWARD_WEIGHTS["target_ball_bonus"] = trial.suggest_float("target_ball_bonus", 0.2, 4.0)
+        REWARD_WEIGHTS["hover_zone_bonus"] = trial.suggest_float("hover_zone_bonus", 0.05, 0.45)
         REWARD_WEIGHTS["attitude_penalty_scale"] = trial.suggest_float(
             "attitude_penalty_scale", 0.05, 0.8
         )
@@ -777,7 +771,10 @@ def run_optuna(
             "gyro_penalty_scale", 0.005, 0.08, log=True
         )
         REWARD_WEIGHTS["gyro_sq_cap"] = trial.suggest_float("gyro_sq_cap", 4.0, 30.0)
-        REWARD_WEIGHTS["progress_coef"] = trial.suggest_float("progress_coef", 0.0003, 0.006, log=True)
+        REWARD_WEIGHTS["accel_penalty_scale"] = trial.suggest_float(
+            "accel_penalty_scale", 0.003, 0.06, log=True
+        )
+        REWARD_WEIGHTS["accel_sq_cap"] = trial.suggest_float("accel_sq_cap", 4.0, 25.0)
         REWARD_WEIGHTS["crash_penalty"] = trial.suggest_float("crash_penalty", -100.0, -10.0)
         REWARD_WEIGHTS["drift_penalty"] = trial.suggest_float("drift_penalty", -60.0, -5.0)
         REWARD_WEIGHTS["action_smooth_coef"] = trial.suggest_float("action_smooth_coef", 0.01, 0.2)
@@ -786,10 +783,15 @@ def run_optuna(
         print(f"  lr={lr:.1e} gamma={gamma:.4f} gae_lambda={gae_lambda:.3f} "
               f"clip={clip_range:.2f} ent={ent_coef:.4f} n_steps={n_steps} "
               f"batch={batch_size} n_epochs={n_epochs} arch={net_arch_size}")
-        print(f"  living={REWARD_WEIGHTS['living_bonus']:.3f} ball={REWARD_WEIGHTS['target_ball_bonus']:.2f} "
-              f"w_z={REWARD_WEIGHTS['pos_z_penalty_scale']:.5f} "
-              f"crash={REWARD_WEIGHTS['crash_penalty']:.0f} "
-              f"smooth={REWARD_WEIGHTS['action_smooth_coef']:.3f}")
+        print(
+            f"  surv={REWARD_WEIGHTS['survival_bonus']:.3f} "
+            f"appr={REWARD_WEIGHTS['approach_progress_coef']:.5f} "
+            f"hz_r={REWARD_WEIGHTS['hover_zone_radius_cm']:.0f} "
+            f"hz_b={REWARD_WEIGHTS['hover_zone_bonus']:.3f} "
+            f"accel_w={REWARD_WEIGHTS['accel_penalty_scale']:.4f} "
+            f"crash={REWARD_WEIGHTS['crash_penalty']:.0f} "
+            f"smooth={REWARD_WEIGHTS['action_smooth_coef']:.3f}"
+        )
 
         env = Monitor(PteroHoverEnv(
             sim_address=sim_addr,
