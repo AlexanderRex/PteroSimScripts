@@ -1,11 +1,8 @@
 # PteroSim Scripts
 
-This repository is the **public** home for **Python scripts, examples, and automation** around PteroSim: RL loops, tooling, and utilities that use the **gRPC Python SDK** (`pterosim`).
+This repository holds **Python scripts, examples, and automation** for PteroSim: RL loops, tooling, and utilities that use the **gRPC Python SDK** (`pterosim`).
 
-The **PteroSim application, engine project, and plugin sources are private.** Do not publish or document private `git` URLs for them. What is public today:
-
-- **This repo** (`PteroSimScripts`) — scripts you run against a local simulator.
-- **[PteroSim v0.1.0 open beta (GitHub Release)](https://github.com/PteroLabsAI/PteroSim-UAV-Simulator/releases/tag/v0.1.0)** — download the simulator build and release notes from there.
+Get the simulator from **[PteroSim v0.1.0 open beta (GitHub Release)](https://github.com/PteroLabsAI/PteroSim-UAV-Simulator/releases/tag/v0.1.0)** — download the build for your OS and read the release notes there.
 
 ---
 
@@ -126,7 +123,7 @@ python3 -m pip install -e "$PTEROSIM_INSTALL/Plugins/PteroSimScripting/SDK/pytho
 3. **Windows:** from the unpacked root, run `PteroSim.exe`. **Linux:** run the launcher or binary supplied in that root (same folder layout; see the release asset).
 4. Start a play session in the shipped build so the simulator is running.
 
-You need a **running packaged game** so the gRPC server in `PteroSimScripting` is listening (default `localhost:10010`). There is **no** public `git clone` path for the simulator or plugins.
+You need a **running game** so the gRPC server in `PteroSimScripting` is listening (default `localhost:10010`).
 
 ---
 
