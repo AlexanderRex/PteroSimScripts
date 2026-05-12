@@ -17,7 +17,7 @@ Get the simulator from **[PteroSim v0.1.0 open beta (GitHub Release)](https://gi
 
 ## Virtual environment
 
-Skipping a venv means **mixed `pip` installs, broken `grpcio` / `protobuf` versions, and permission pain on system Python**. Create one **in this repo** and activate it before every session.
+Virtual environment is required for smooth usage. Create one **in this repo** and activate it before every session.
 
 **Windows — PowerShell**
 
@@ -47,6 +47,22 @@ Deactivate when finished:
 deactivate
 ```
 
+To **remove** the virtual environment (e.g. recreate from scratch or reclaim disk space), run **`deactivate` first** if the venv is still active (your prompt shows `(.venv)`). Then `cd` to this repo and delete the `.venv` folder.
+
+**Windows — PowerShell**
+
+```powershell
+cd $env:USERPROFILE\Documents\PteroSimScripts
+Remove-Item -Recurse -Force .venv
+```
+
+**Linux / macOS — bash**
+
+```bash
+cd ~/Documents/PteroSimScripts
+rm -rf .venv
+```
+
 ---
 
 ## Install the `pterosim` package
@@ -69,6 +85,7 @@ python -m pip install -e .
 cd ~/PteroSim/Plugins/PteroSimScripting/SDK/python
 python3 -m pip install -U pip
 python3 -m pip install -e .
+python -m pip install numpy
 ```
 
 ## Get and run PteroSim
@@ -90,8 +107,7 @@ With the venv **activated** and PteroSim **running**:
 from pterosim import PteroSim
 
 sim = PteroSim("localhost:10010")
-# e.g. sim.start(), sim.spawn("F450", x=0, y=0, z=200), ...
-sim.close()
+
 ```
 
 Remote machine: use `"192.168.1.10:10010"` (host running the simulator) instead of `localhost`, and allow TCP on that port through the firewall.
