@@ -9,30 +9,31 @@ from pterosim import PteroSim
 SPAWN = (0.0, 0.0, 0.0)
 CRUISE_Z = 400.0
 LEG = 1000.0
+STABLE_S = 0.5
 
 
-def xyz(sim, instance_id):
+def _xyz(sim, instance_id):
     for st in sim.aircraft_status():
         if st.instance_id == instance_id:
             return st.x, st.y, st.z
     raise RuntimeError(f"No status for instance_id={instance_id}")
 
 
-def wait_near(sim, instance_id, target, radius_cm, timeout_s, label):
+def _wait_near(sim, instance_id, target, radius_cm, timeout_s, label):
     deadline = time.time() + timeout_s
     stable = None
     while time.time() < deadline:
-        pos = xyz(sim, instance_id)
+        pos = _xyz(sim, instance_id)
         err = math.dist(pos, target)
         if err <= radius_cm:
             stable = time.time() if stable is None else stable
-            if time.time() - stable >= 0.5:
+            if time.time() - stable >= STABLE_S:
                 print(f"{label}: ok ({err:.0f} cm)")
                 return
         else:
             stable = None
         time.sleep(0.1)
-    raise TimeoutError(f"{label}: timeout at {xyz(sim, instance_id)}")
+    raise TimeoutError(f"{label}: timeout at {_xyz(sim, instance_id)}")
 
 
 with PteroSim("localhost:10010") as sim:
@@ -42,7 +43,7 @@ with PteroSim("localhost:10010") as sim:
         pass
 
     drone = sim.spawn("F450", x=SPAWN[0], y=SPAWN[1], z=SPAWN[2])
-    hx, hy, hz = xyz(sim, drone.instance_id)
+    hx, hy, hz = _xyz(sim, drone.instance_id)
     z = hz + CRUISE_Z
     z_high = hz + CRUISE_Z * 2
 
@@ -73,7 +74,7 @@ with PteroSim("localhost:10010") as sim:
     for label, target, yaw in waypoints:
         print(f"-> {label}")
         drone.go_to(*target, yaw=yaw, acceptance_radius_cm=80)
-        wait_near(sim, drone.instance_id, target, 80, 90, label)
+        _wait_near(sim, drone.instance_id, target, 80, 90, label)
 
     print("-> land")
     drone.land(yaw=0, acceptance_radius_cm=1)
@@ -81,16 +82,16 @@ with PteroSim("localhost:10010") as sim:
     deadline = time.time() + 60
     stable = None
     while time.time() < deadline:
-        pos = xyz(sim, drone.instance_id)
+        pos = _xyz(sim, drone.instance_id)
         if abs(pos[2] - hz) <= 1:
             stable = time.time() if stable is None else stable
-            if time.time() - stable >= 0.5:
+            if time.time() - stable >= STABLE_S:
                 print(f"land: ok Z={pos[2]:.0f}")
                 break
         else:
             stable = None
         time.sleep(0.1)
     else:
-        raise TimeoutError(f"land: timeout at Z={xyz(sim, drone.instance_id)[2]:.0f}")
+        raise TimeoutError(f"land: timeout at Z={_xyz(sim, drone.instance_id)[2]:.0f}")
 
 print("done")
