@@ -2,18 +2,13 @@
 """
 Air stunt demo — spawn F450, fly a show path, land.
 
-Uses: spawn, start, go_to, land, aircraft_status.
-
-Requires PteroSimCore + PteroSimScripting on feature/land-command (rebuilt).
-
-Usage (PIE, gRPC localhost:10010, sim stopped):
+Usage (simulator running, gRPC on localhost:10010):
     python demo_air_stunt.py
 """
 
 from __future__ import annotations
 
 import math
-import sys
 import time
 
 from pterosim import PteroSim
@@ -75,7 +70,7 @@ def wait_go_to(sim: PteroSim, instance_id: int, target, *, label: str) -> None:
 
 
 def wait_landed(sim: PteroSim, instance_id: int, home_z: float) -> None:
-    """Poll until Z is at spawn height after land() (motors cut in Core)."""
+    """Poll until Z is at spawn height after land()."""
     deadline = time.time() + LAND_TIMEOUT_S
     stable_since = None
     while time.time() < deadline:
@@ -151,11 +146,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        print("\nInterrupted", file=sys.stderr)
-        raise SystemExit(130)
-    except Exception as exc:
-        print(f"\nERROR: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+    raise SystemExit(main())
