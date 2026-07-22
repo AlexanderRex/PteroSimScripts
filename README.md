@@ -12,6 +12,7 @@ Get the simulator from **[PteroSim v0.1.0 open beta (GitHub Release)](https://gi
 - [Install the `pterosim` package](#install-the-pterosim-package)
 - [Get and run PteroSim](#get-and-run-pterosim)
 - [Connect from Python](#connect-from-python)
+- [Pre-commit hooks (contributors)](#pre-commit-hooks-contributors)
 
 ---
 
@@ -109,3 +110,22 @@ sim = PteroSim("localhost:10010")
 ```
 
 Remote machine: use `"192.168.1.10:10010"` (host running the simulator) instead of `localhost`, and allow TCP on that port through the firewall.
+
+---
+
+## Pre-commit hooks (contributors)
+
+Lint/format rules live in a single place — [`.pre-commit-config.yaml`](.pre-commit-config.yaml) (ruff + ruff-format, plus whitespace/EOF/YAML/TOML/AST checks). CI runs the exact same rules via `pre-commit run --all-files`, so what passes locally passes in CI.
+
+Install the hook once (with the venv activated):
+
+```bash
+python -m pip install pre-commit
+pre-commit install
+```
+
+From then on, `git commit` runs the checks automatically. To run them manually across the whole repo:
+
+```bash
+pre-commit run --all-files
+```
