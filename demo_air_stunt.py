@@ -56,7 +56,7 @@ def main() -> None:
         drone = sim.spawn("F450", x=SPAWN[0], y=SPAWN[1], z=SPAWN[2])
         hx, hy, hz = xyz(sim, drone.instance_id)
         z = hz + CRUISE_Z
-   
+
         sim.start()
         deadline = time.time() + 5
         while time.time() < deadline:
