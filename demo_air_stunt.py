@@ -59,7 +59,7 @@ def main() -> None:
         z_high = hz + CRUISE_Z * 2
 
         sim.start()
-        deadline = time.time() + 15
+        deadline = time.time() + 5
         while time.time() < deadline:
             if any(
                 st.instance_id == drone.instance_id and st.actual_frequency_hz > 0 and not st.crashed
@@ -74,11 +74,7 @@ def main() -> None:
             ("takeoff", (hx, hy, z), 0),
             ("square +X", (hx + LEG, hy, z), 0),
             ("square +Y", (hx + LEG, hy + LEG, z), 90),
-            ("square -X", (hx - LEG, hy + LEG, z), 180),
-            ("square -Y", (hx - LEG, hy - LEG, z), 270),
-            ("square close", (hx + LEG, hy - LEG, z), 0),
             ("diagonal", (hx - LEG, hy + LEG, z), 135),
-            ("high hover", (hx, hy, z_high), 0),
             ("above home", (hx, hy, z), 0),
         ]
 
@@ -88,7 +84,7 @@ def main() -> None:
             wait_near(sim, drone.instance_id, target, 80, 90, label)
 
         print("-> land")
-        drone.land(yaw=0, acceptance_radius_cm=1)
+        drone.land()
 
         deadline = time.time() + 60
         stable: float | None = None
